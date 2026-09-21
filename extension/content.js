@@ -109,6 +109,26 @@
   const RENDER_STREAM_KEY = 'renderStreamEnabled';
   /** Timestamps are useful for debugging, but too noisy for the normal transcript. */
   const SHOW_TIMES_KEY = 'showStreamTimes';
+  /** Answer ChatGPT's own "Allow ChatGPT to use <app>?" card. The popup can turn it off. */
+  const AUTO_APPROVE_KEY = 'autoApproveToolCalls';
+  /** React mounts the card and its buttons in a burst; answer once the burst has settled. */
+  const APPROVE_SETTLE_MS = 150;
+  /** A click that changes nothing must not become a loop, so each card gets a few tries. */
+  const APPROVE_MAX_TRIES = 3;
+  /**
+   * Long enough for the page to take the click away. The card does not vanish the instant
+   * Allow is pressed — the request is in flight first — and a shorter window spent that
+   * grace period re-approving something ChatGPT had already accepted.
+   */
+  const APPROVE_RETRY_MS = 2500;
+  /**
+   * The per-card counter above is keyed by node, so a card React re-mounts starts over. That
+   * is correct for a genuinely new question and wrong for the failure that looks identical:
+   * approve, the call fails, ChatGPT redraws the same question as a new node, forever. This
+   * ceiling is what that case runs into, and it is deliberately the only unconditional stop.
+   */
+  const APPROVE_WINDOW_MS = 60_000;
+  const APPROVE_WINDOW_MAX = 10;
   /**
    * Production now starts with transcript overwrite enabled. Tests deliberately start off
    * and opt in case-by-case so renderer regressions do not contaminate unrelated capture
@@ -118,6 +138,8 @@
   const TEST_MODE = typeof globalThis.CLF_TEST_HOOK === 'function';
   let RENDER_STREAM = TEST_MODE ? false : true;
   let SHOW_TIMES = false;
+  /** Same rule as Overwrite: on in production, off under the test hook so stubs stay inert. */
+  let AUTO_APPROVE = TEST_MODE ? false : true;
   let renderPreferenceReady = TEST_MODE;
   const renderStreamAllowed = () => RENDER_STREAM && renderPreferenceReady;
   let lastPresentationScrollInputAt = -Infinity;
@@ -151,8 +173,9 @@
       return;
     }
     try {
-      const stored = await chrome.storage.local.get([RENDER_STREAM_KEY, SHOW_TIMES_KEY]);
+      const stored = await chrome.storage.local.get([RENDER_STREAM_KEY, SHOW_TIMES_KEY, AUTO_APPROVE_KEY]);
       if (typeof stored[RENDER_STREAM_KEY] === 'boolean') RENDER_STREAM = stored[RENDER_STREAM_KEY];
+      if (typeof stored[AUTO_APPROVE_KEY] === 'boolean') AUTO_APPROVE = stored[AUTO_APPROVE_KEY];
       SHOW_TIMES = stored[SHOW_TIMES_KEY] === true;
     } catch {
       // A storage failure must not leave the renderer permanently waiting. The explicit
@@ -2727,6 +2750,101 @@
   }
 
   const turnIdOf = (section) => CLF_DOM.turnIdOf(section);
+
+  /**
+   * How many times Allow has been pressed on one card, keyed by the card node itself.
+   *
+   * A WeakMap rather than an attribute on the card: nothing of ours is written into
+   * ChatGPT's own DOM, and a card React re-mounts is legitimately a new question. The
+   * counter exists for the one failure that would otherwise be unbounded — a click that
+   * is accepted by the page but leaves the card standing.
+   */
+  const approvalAttempts = new WeakMap();
+  /** When Allow was last pressed, within the rolling window. */
+  let approvalClicks = [];
+  let approvalCeilingLogged = false;
+
+  /**
+   * Press Allow on the approval cards this app is the subject of.
+   *
+   * ChatGPT asks before each connector call, and a chat driving this machine spends the
+   * whole run waiting on that question. Answering it is the entire feature — but only for
+   * this app's own connectors. The same card is how ChatGPT asks before sending mail or
+   * touching a drive on somebody else's connector, and standing consent to this app is not
+   * consent to those, so an unrecognised app name is left for the user to answer by hand.
+   *
+   * That name is the exact string from the card's own app line, tested against the same
+   * OUR_CONNECTORS list the attribution path uses. Losing that line to a redesign therefore
+   * stops the automation rather than widening it, which is the direction to fail in.
+   *
+   * Nothing is clicked before the stored preference has been read, otherwise a browser
+   * that starts with the switch off would still answer the first card of the session.
+   */
+  function approveToolRequests() {
+    if (!alive || !AUTO_APPROVE || !renderPreferenceReady) return;
+    const now = Date.now();
+    approvalClicks = approvalClicks.filter((at) => now - at < APPROVE_WINDOW_MS);
+    for (const request of CLF_DOM.toolApprovals()) {
+      if (!ourConnectorApp(request.app)) continue;
+      if (approvalClicks.length >= APPROVE_WINDOW_MAX) {
+        if (!approvalCeilingLogged) {
+          approvalCeilingLogged = true;
+          console.warn('[Chat On Steroids] Auto-allow stopped: too many approvals in one minute. Answer the card yourself, or reload the tab.');
+        }
+        return;
+      }
+      const seen = approvalAttempts.get(request.card) || { tries: 0, at: 0 };
+      if (seen.tries >= APPROVE_MAX_TRIES || now - seen.at < APPROVE_RETRY_MS) continue;
+      approvalAttempts.set(request.card, { tries: seen.tries + 1, at: now });
+      approvalClicks.push(now);
+      try {
+        request.allow.click();
+      } catch {
+        // A button that disappeared between the scan and the click is the normal race:
+        // the question has been answered elsewhere, which is the outcome we wanted.
+      }
+    }
+  }
+
+  /**
+   * Watch for approval cards arriving.
+   *
+   * The card is inserted complete, so insertion is the moment to answer — but its buttons
+   * are mounted in the same React commit and a click in that turn can be swallowed, which
+   * is why the answer waits out a short settle window instead of firing per record. The
+   * one-second observe tick calls this as well, covering the card that was already on the
+   * page when this recorder took over and the one whose button mounted disabled.
+   */
+  function watchToolApprovals() {
+    if (typeof MutationObserver !== 'function' || !document.body) return;
+    let timer = null;
+    const settle = () => {
+      if (timer !== null) return;
+      timer = setTimeout(() => {
+        timer = null;
+        approveToolRequests();
+      }, APPROVE_SETTLE_MS);
+    };
+    const observer = new MutationObserver((records) => {
+      // Same retirement test its neighbours use: an orphaned world keeps its observers, and
+      // `alive` alone would let one answer a card for a second after the takeover.
+      if (!recorderHandle.healthy() || !AUTO_APPROVE) return;
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (!node || node.nodeType !== 1 || !CLF_DOM.hasApprovalCard(node)) continue;
+          settle();
+          return;
+        }
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    rememberCleanup(() => {
+      observer.disconnect();
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    });
+    approveToolRequests();
+  }
 
   /**
    * Watches for connector rows as ChatGPT inserts them, rather than waiting for a tick.
@@ -10687,6 +10805,12 @@
         SHOW_TIMES = changes[SHOW_TIMES_KEY].newValue === true;
         changed = true;
       }
+      // Switching auto-allow on is itself the instruction to answer whatever is already
+      // asking; it changes no pixel of ours, so it does not go through the repaint below.
+      if (changes[AUTO_APPROVE_KEY]) {
+        AUTO_APPROVE = changes[AUTO_APPROVE_KEY].newValue !== false;
+        if (AUTO_APPROVE) approveToolRequests();
+      }
       if (!changed) return;
       renderPreferenceReady = true;
       paint();
@@ -11507,10 +11631,12 @@
   }
   watchComposer();
   watchToolRows();
+  watchToolApprovals();
   watchTranscript();
 
   every(OBSERVE_MS, () => {
     observe();
+    approveToolRequests();
     syncTheme();
     injectControl();
     injectStage();
@@ -11643,6 +11769,12 @@
         renderPreferenceReady = true;
       },
       renderStreamEnabled: () => RENDER_STREAM,
+      /** Test-only: production defaults ON; stubs stay inert until a case opts in. */
+      setAutoApprove: (on) => {
+        AUTO_APPROVE = on === true;
+        renderPreferenceReady = true;
+      },
+      approveToolRequests,
       setDesktopProjectInputForTest: (claim) => { desktopProjectInput = claim; },
       desktopProjectInputForTest: () => desktopProjectInput,
       setShowTimes: (on) => {

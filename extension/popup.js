@@ -12,10 +12,12 @@
 const $ = (id) => document.getElementById(id);
 const RENDER_STREAM_KEY = 'renderStreamEnabled';
 const SHOW_TIMES_KEY = 'showStreamTimes';
+const AUTO_APPROVE_KEY = 'autoApproveToolCalls';
 const POLL_MS = 1500;
 
 let overwriteEnabled = true;
 let showTimes = false;
+let autoApprove = true;
 let latest = { status: null, tab: null };
 let openedOnFailure = false;
 
@@ -363,11 +365,13 @@ function syncOverwrite() {
 }
 
 async function loadPreferences() {
-  const stored = await chrome.storage.local.get([RENDER_STREAM_KEY, SHOW_TIMES_KEY]);
+  const stored = await chrome.storage.local.get([RENDER_STREAM_KEY, SHOW_TIMES_KEY, AUTO_APPROVE_KEY]);
   overwriteEnabled = stored[RENDER_STREAM_KEY] !== false;
   showTimes = stored[SHOW_TIMES_KEY] === true;
+  autoApprove = stored[AUTO_APPROVE_KEY] !== false;
   syncOverwrite();
   $('timeToggle').checked = showTimes;
+  $('approveToggle').checked = autoApprove;
 }
 
 /** Puts one value on the clipboard and says so in place, without moving anything. */
@@ -426,6 +430,20 @@ $('overwriteToggle').addEventListener('change', async () => {
 $('timeToggle').addEventListener('change', async () => {
   showTimes = $('timeToggle').checked === true;
   await chrome.storage.local.set({ [SHOW_TIMES_KEY]: showTimes });
+});
+
+// Answering ChatGPT's "Allow ChatGPT to use <app>?" card for this app's own connectors. On by
+// default, because a chat driving this machine otherwise stops at every call; the switch is
+// here so it can be taken back without unloading the extension.
+$('approveToggle').addEventListener('change', async () => {
+  const previous = autoApprove;
+  autoApprove = $('approveToggle').checked === true;
+  try {
+    await chrome.storage.local.set({ [AUTO_APPROVE_KEY]: autoApprove });
+  } catch {
+    autoApprove = previous;
+    $('approveToggle').checked = autoApprove;
+  }
 });
 
 // A popup is open for seconds at a time and the three stages move within those seconds.

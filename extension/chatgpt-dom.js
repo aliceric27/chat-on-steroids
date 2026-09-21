@@ -2529,6 +2529,67 @@ var CLF_DOM = (() => {
       toggle.click(); check();
     });
   }
+  /**
+   * ChatGPT's own tool-approval card: "Allow ChatGPT to use <app>?", with Deny beside Allow.
+   *
+   * Two provider test ids anchor the card and its action row, and inside that row the word on
+   * the button is what identifies Allow. That is deliberately the opposite of the rest of this
+   * file, which distrusts visible labels: here the label is the only anchor that carries the
+   * *meaning* of the button, and the alternative — `btn-primary` — is an emphasis class, so a
+   * redesign that emphasised Deny instead would have had this press Deny with full confidence.
+   * `btn-primary` is therefore kept only to break a tie between two affirmative labels, and the
+   * split control's dropdown half is excluded outright because it opens a menu rather than
+   * answering. Anything this cannot name exactly returns null and nothing is clicked: an
+   * unlisted locale costs the automation and leaves the user to click, which is the cheap
+   * failure. Pressing the wrong button is the expensive one.
+   */
+  const APPROVAL = '[data-testid="tool-approval-card"]';
+  const APPROVAL_ACTIONS = '[data-testid="tool-action-buttons"]';
+  /** The card's own quiet app line, above the question. Whoever reads it decides on an exact name. */
+  const APPROVAL_APP = '[class*="text-token-text-tertiary"]';
+  /**
+   * Affirmative button labels, lowercased. Every entry was checked against the refusal word of
+   * the same locale — none of these is anybody's Deny — and an entry that could be either must
+   * not be added, because this list is what authorises a click rather than merely confirming one.
+   */
+  const ALLOW_WORDS = new Set([
+    'allow', 'allow once', '允許', '允许', '許可', '許可する', '허용', 'autoriser', 'permitir',
+    'zulassen', 'erlauben', 'consenti', 'consentire', 'разрешить', 'toestaan', 'tillåt',
+    'zezwól', 'izin ver', 'cho phép', 'อนุญาต', 'السماح'
+  ]);
+
+  const onScreen = node => safe(() => !!node && node.getClientRects().length > 0 &&
+    !node.closest('[hidden],[aria-hidden="true"],[inert]') && !node.closest(OWN_SURFACES), false);
+
+  function approvalAllowButton(card) {
+    return safe(() => {
+      const actions = card.querySelector(APPROVAL_ACTIONS);
+      if (!actions) return null;
+      const buttons = [...actions.querySelectorAll('button')].filter(button =>
+        !button.disabled && !button.hasAttribute('aria-haspopup') && onScreen(button));
+      const named = buttons.filter(button => ALLOW_WORDS.has(text(button, 40).toLowerCase()));
+      if (named.length === 1) return named[0];
+      // Two buttons both say yes — "Allow" beside "Allow once", say. Emphasis breaks that tie,
+      // and only that tie: both candidates already passed the word test.
+      const primary = named.filter(button => button.classList.contains('btn-primary'));
+      return primary.length === 1 ? primary[0] : null;
+    }, null);
+  }
+
+  /** Whether this node is an approval card or brought one with it, for the reason hasConnectorRow exists. */
+  function hasApprovalCard(node) {
+    return safe(() => !!node && node.nodeType === 1 && (node.matches(APPROVAL) || !!node.querySelector(APPROVAL)), false);
+  }
+
+  /** Every approval card on screen whose Allow button was identified without ambiguity. */
+  function toolApprovals() {
+    return safe(() => [...document.querySelectorAll(APPROVAL)].filter(onScreen).map(card => ({
+      card,
+      app: text(card.querySelector(APPROVAL_APP), 120),
+      allow: approvalAllowButton(card)
+    })).filter(request => request.allow), []);
+  }
+
   return {
     TURN_SELECTOR: TURN,
     AUTHORED_SELECTOR: '[data-message-author-role="assistant"], .markdown, [data-content-search-unit-key], [data-markdown-text-style="assistant-message"]',
@@ -2593,6 +2654,8 @@ var CLF_DOM = (() => {
     isConnectorBlock,
     markLocalBlock,
     hasConnectorRow,
+    hasApprovalCard,
+    toolApprovals,
     connectorRows,
     fiberRef,
     activitySummaryRows,
